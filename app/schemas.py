@@ -1,5 +1,5 @@
 from pydantic import BaseModel
 
-class Post(BaseModel):
+class TextPost(BaseModel):
     title: str
     content: str

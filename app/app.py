@@ -1,40 +1,99 @@
-from fastapi import FastAPI, HTTPException
-from app.schemas import Post
-
-app = FastAPI()
-
-text_posts = {
-    1: {"title": "Launching the Tiny AI Helper", "content": "Today I deployed a lightweight assistant designed to answer quick coding questions"},
-    2: {"title": "Gardening Journal: Planta Care for Spring", "content": "This week I pruned rose bushes, checked soil pH, and planned a mulching schedule"},
-    3: {"title": "Cloud Cost Optimization Experiment", "content": "I compared reserved instances vs. on-demand and set auto-scaling thresholds"},
-    4: {"title": "Photo Walk: Street Portraits in Golden Hour", "content": "Captured candid portraits emphasizing natural lighting and urban textures"},
-    5: {"title": "DIY Desk Organizer Build Plan", "content": "I designed a modular wooden organizer with cable channels and a drawer"},
-    6: {"title": "Meal Prep: 5-Ingredient Weeknight Dinners", "content": "I planned five quick, balanced meals for busy weeknights"},
-    7: {"title": "City Bike Route Optimization", "content": "Mapped safer routes through neighborhoods with fewer hills"},
-    8: {"title": "Indie Game Prototype Milestone", "content": "Implemented a basic player controller and a minimal level design"},
-    9: {"title": "Morning Routine Study", "content": "Tracked wake times and hydration to improve focus"},
-    10: {"title": "Book Club: Sci-Fi Short Stories", "content": "Selected a collection of crisp, thought-provoking tales for discussion"},
-}
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from app.schemas import TextPost
+from app.db import Post, create_db_and_tables, get_async_session
+from sqlalchemy.ext.asyncio import AsyncSession
+from contextlib import asynccontextmanager
+from sqlalchemy import select
+from app.images import imageKit
+import shutil
+import os
+import uuid
+import tempfile
 
 
-@app.get("/posts")
-def get_all_posts(limit: int = None):
-    if limit:
-        return list(text_posts.values())[:limit]
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await create_db_and_tables()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    session: AsyncSession = Depends(get_async_session)
+):
+    temp_file_path = None
     
-    return text_posts
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
+        
+        upload_result = imageKit.files.upload(
+            file=open(temp_file_path, "rb"),
+            file_name=file.filename,
+        )
+        
+        post = Post(
+            caption=caption,
+            url=upload_result.url,
+            file_type="video" if file.content_type.startswith("video/") else "image",
+            file_name=upload_result.name
+        )
+        session.add(post)
+        await session.commit()
+        await session.refresh(post)
+        return post
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+        file.file.close()
+        
 
-@app.get("/posts/{id}")
-def get_post(id: int) -> Post:
-
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post not found")
+@app.get("/feed")
+async def get_feed(
+    session: AsyncSession = Depends(get_async_session)
+):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    posts = [row[0] for row in result.all()]
     
-    return text_posts.get(id)
+    posts_data = []
+    for post in posts:
+        posts_data.append(
+            {
+                "id": str(post.id),
+                "caption": post.caption,
+                "url": post.url,
+                "file_type": post.file_type,
+                "file_name": post.file_name,
+                "created_at": post.created_at.isoformat()
+            }
+        )
+    
+    return {"posts": posts_data}
 
-@app.post("/posts")
-def create_post(post: Post) -> Post:
-    new_post = {"title": post.title, "content": post.content}
-    text_posts[max(text_posts.keys()) + 1] = new_post
-    return new_post
-
+@app.delete("/posts/{post_id}")
+async def delete_post(
+    post_id: str, 
+    session: AsyncSession = Depends(get_async_session)
+):
+    try:
+        post_uuid = uuid.UUID(post_id)
+        result = await session.execute(select(Post).where(Post.id == post_uuid))
+        post = result.scalars().first()
+        
+        if not post:
+            raise HTTPException(status_code=404, detail="Post not found")
+        
+        await session.delete(post)
+        await session.commit()
+        
+        return {"success": True, "message": "Post deleted succesfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+        
